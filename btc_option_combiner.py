@@ -69,8 +69,13 @@ put_strike = st.sidebar.selectbox("📉 Select PUT Option", [f"{p['strike_price'
 interval = st.sidebar.selectbox("⏱️ Timeframe", ['1m', '5m', '15m'])
 
 # Extract product IDs
-selected_call = next(c for c in calls if f"{c['strike_price']} - {c['display_name']}" == call_strike)
-selected_put = next(p for p in puts if f"{p['strike_price']} - {p['display_name']}" == put_strike)
+# Extract strike price from selection (e.g. "105000 - BTC-105000-C")
+selected_call_strike = float(call_strike.split(" - ")[0])
+selected_put_strike = float(put_strike.split(" - ")[0])
+
+selected_call = next(c for c in calls if c['strike_price'] == selected_call_strike)
+selected_put = next(p for p in puts if p['strike_price'] == selected_put_strike)
+
 
 call_df = fetch_ohlc(selected_call['id'], interval)
 put_df = fetch_ohlc(selected_put['id'], interval)
