@@ -1,130 +1,133 @@
 import streamlit as st
+import requests
 import pandas as pd
 import plotly.graph_objects as go
-import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
+import numpy as np
 
-# Supertrend calculation
-def calculate_supertrend(df, period=20, multiplier=2):
+st.set_page_config(page_title="BTC Option Combiner", layout="wide")
+
+# ───────────────────────────────────────
+# 🧮 Technical Indicators
+# ───────────────────────────────────────
+def calculate_vwap(df):
+    q = df['volume']
+    p = df['close']
+    vwap = (p * q).cumsum() / q.cumsum()
+    return vwap
+
+def supertrend(df, period=20, multiplier=2):
     hl2 = (df['high'] + df['low']) / 2
-    df['ATR'] = df['high'].rolling(period).max() - df['low'].rolling(period).min()
-    df['upperband'] = hl2 + (multiplier * df['ATR'])
-    df['lowerband'] = hl2 - (multiplier * df['ATR'])
-    df['supertrend'] = True
+    atr = df['high'].rolling(period).max() - df['low'].rolling(period).min()
+    upperband = hl2 + multiplier * atr
+    lowerband = hl2 - multiplier * atr
+    supertrend = [np.nan] * len(df)
+    direction = [True] * len(df)
 
     for i in range(1, len(df)):
-        curr, prev = i, i - 1
-
-        if df['close'][curr] > df['upperband'][prev]:
-            df['supertrend'][curr] = True
-        elif df['close'][curr] < df['lowerband'][prev]:
-            df['supertrend'][curr] = False
+        if df['close'][i] > upperband[i-1]:
+            direction[i] = True
+        elif df['close'][i] < lowerband[i-1]:
+            direction[i] = False
         else:
-            df['supertrend'][curr] = df['supertrend'][prev]
-            if df['supertrend'][curr] and df['lowerband'][curr] < df['lowerband'][prev]:
-                df['lowerband'][curr] = df['lowerband'][prev]
-            if not df['supertrend'][curr] and df['upperband'][curr] > df['upperband'][prev]:
-                df['upperband'][curr] = df['upperband'][prev]
+            direction[i] = direction[i-1]
+            upperband[i] = min(upperband[i], upperband[i-1]) if direction[i] else upperband[i]
+            lowerband[i] = max(lowerband[i], lowerband[i-1]) if not direction[i] else lowerband[i]
 
-    return df
+        supertrend[i] = lowerband[i] if direction[i] else upperband[i]
 
-# VWAP calculation
-def calculate_vwap(df):
-    df['vwap'] = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
-    return df
+    return supertrend
 
-# Fetch options from Delta Exchange
+# ───────────────────────────────────────
+# 🔌 Deribit API Helpers
+# ───────────────────────────────────────
 @st.cache_data(ttl=60)
-def fetch_options():
-    url = "https://api.delta.exchange/v2/ltp"
-    contracts = requests.get("https://api.delta.exchange/v2/products").json()
-    all_contracts = contracts.get('result', [])
-    option_contracts = [c for c in all_contracts if c['contract_type'] == 'option' and c['asset_symbol'] == 'BTC']
+def get_option_instruments():
+    url = "https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=option&expired=false"
+    r = requests.get(url)
+    return r.json()["result"]
 
-    calls = sorted([c for c in option_contracts if c['option_type'] == 'call'], key=lambda x: x['strike_price'])
-    puts = sorted([c for c in option_contracts if c['option_type'] == 'put'], key=lambda x: x['strike_price'])
+@st.cache_data(ttl=60)
+def get_ohlc(instrument_name, timeframe):
+    # Convert timeframe for Deribit
+    resolution_map = {
+        "1 min": 60,
+        "5 min": 300,
+        "15 min": 900,
+        "1 hour": 3600,
+        "4 hours": 14400,
+        "1 day": 86400
+    }
+    end = int(time.time() * 1000)
+    start = end - resolution_map[timeframe] * 1000 * 100
 
-    return calls, puts
+    url = f"https://www.deribit.com/api/v2/public/get_tradingview_chart_data?instrument_name={instrument_name}&start_timestamp={start}&end_timestamp={end}&resolution={resolution_map[timeframe]}"
+    r = requests.get(url)
+    data = r.json()["result"]
+    df = pd.DataFrame(data)
+    if df.empty: return None
 
-# Fetch OHLC for a contract
-def fetch_ohlc(product_id, interval='1m'):
-    url = f"https://api.delta.exchange/v2/history/candles?resolution={interval}&contract_id={product_id}&limit=100"
-    data = requests.get(url).json()
-    candles = data.get('result', [])
-    df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
-    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df = df.rename(columns={
+        "ticks": "timestamp",
+        "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
+    })
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
     return df
 
-# App Layout
-st.set_page_config(page_title="BTC Option Combiner", layout="wide")
-st.title("📊 BTC Options Combined Chart (Delta Exchange India)")
-st.caption("Select one Call and one Put. OHLC will be combined into a single chart with VWAP and Supertrend (20,2). Auto-refreshes every 60 seconds.")
+# ───────────────────────────────────────
+# 🎛️ Sidebar - User Controls
+# ───────────────────────────────────────
+st.sidebar.title("🔘 Select Options")
+instruments = get_option_instruments()
 
-# Sidebar selections
-calls, puts = fetch_options()
+calls = [i for i in instruments if i['option_type'] == 'call']
+puts = [i for i in instruments if i['option_type'] == 'put']
 
-call_strike = st.sidebar.selectbox("📈 Select CALL Option", [f"{c['strike_price']} - {c['display_name']}" for c in calls])
-put_strike = st.sidebar.selectbox("📉 Select PUT Option", [f"{p['strike_price']} - {p['display_name']}" for p in puts])
-interval = st.sidebar.selectbox("⏱️ Timeframe", ['1m', '5m', '15m'])
+call_options = [c["instrument_name"] for c in sorted(calls, key=lambda x: x["strike"])]
+put_options = [p["instrument_name"] for p in sorted(puts, key=lambda x: x["strike"])]
 
-# Extract product IDs
-# Extract strike price from selection (e.g. "105000 - BTC-105000-C")
-selected_call_strike = float(call_strike.split(" - ")[0])
-selected_put_strike = float(put_strike.split(" - ")[0])
+selected_call = st.sidebar.selectbox("📈 Call Option", call_options)
+selected_put = st.sidebar.selectbox("📉 Put Option", put_options)
 
-selected_call = next(c for c in calls if c['strike_price'] == selected_call_strike)
-selected_put = next(p for p in puts if p['strike_price'] == selected_put_strike)
+timeframe = st.sidebar.selectbox("⏱️ Timeframe", ["1 min", "5 min", "15 min", "1 hour", "4 hours", "1 day"])
 
+# ───────────────────────────────────────
+# 📊 Fetch & Combine Data
+# ───────────────────────────────────────
+df_call = get_ohlc(selected_call, timeframe)
+df_put = get_ohlc(selected_put, timeframe)
 
-call_df = fetch_ohlc(selected_call['id'], interval)
-put_df = fetch_ohlc(selected_put['id'], interval)
+if df_call is not None and df_put is not None:
+    df = df_call.copy()
+    df["open"] += df_put["open"]
+    df["high"] += df_put["high"]
+    df["low"] += df_put["low"]
+    df["close"] += df_put["close"]
+    df["volume"] += df_put["volume"]
 
-# Merge & combine OHLC
-combined = pd.merge(call_df, put_df, on='time', suffixes=('_call', '_put'))
-combined['open'] = combined['open_call'] + combined['open_put']
-combined['high'] = combined['high_call'] + combined['high_put']
-combined['low'] = combined['low_call'] + combined['low_put']
-combined['close'] = combined['close_call'] + combined['close_put']
-combined['volume'] = combined['volume_call'] + combined['volume_put']
-combined = combined[['time', 'open', 'high', 'low', 'close', 'volume']]
+    df["vwap"] = calculate_vwap(df)
+    df["supertrend"] = supertrend(df)
 
-# Add VWAP and Supertrend
-combined = calculate_vwap(combined)
-combined = calculate_supertrend(combined)
+    # ───────────────────────────────────────
+    # 📈 Plotting Chart
+    # ───────────────────────────────────────
+    fig = go.Figure()
 
-# Chart
-fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df["timestamp"],
+        open=df["open"],
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        name="Combined OHLC"
+    ))
 
-fig.add_trace(go.Candlestick(
-    x=combined['time'],
-    open=combined['open'],
-    high=combined['high'],
-    low=combined['low'],
-    close=combined['close'],
-    name='Combined'
-))
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["vwap"], mode="lines", name="VWAP", line=dict(color="blue")))
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["supertrend"], mode="lines", name="Supertrend", line=dict(color="green")))
 
-fig.add_trace(go.Scatter(x=combined['time'], y=combined['vwap'], mode='lines', name='VWAP', line=dict(color='blue')))
-fig.add_trace(go.Scatter(
-    x=combined['time'],
-    y=combined['lowerband'],
-    mode='lines',
-    name='Supertrend Lower',
-    line=dict(color='green')
-))
-fig.add_trace(go.Scatter(
-    x=combined['time'],
-    y=combined['upperband'],
-    mode='lines',
-    name='Supertrend Upper',
-    line=dict(color='red')
-))
+    fig.update_layout(title="📊 Combined BTC Option Chart (Call + Put)", xaxis_title="Time", yaxis_title="Price", xaxis_rangeslider_visible=False)
 
-fig.update_layout(title="Combined Call + Put Chart", xaxis_title="Time", yaxis_title="Price", xaxis_rangeslider_visible=False)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# Auto-refresh every 60 seconds
-st.experimental_singleton.clear()
-st.experimental_rerun()
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.error("⚠️ Could not fetch data for one or both selected options.")
