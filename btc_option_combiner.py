@@ -49,8 +49,8 @@ def get_option_instruments():
     return r.json()["result"]
 
 @st.cache_data(ttl=60)
+@st.cache_data(ttl=60)
 def get_ohlc(instrument_name, timeframe):
-    # Convert timeframe for Deribit
     resolution_map = {
         "1 min": 60,
         "5 min": 300,
@@ -59,21 +59,32 @@ def get_ohlc(instrument_name, timeframe):
         "4 hours": 14400,
         "1 day": 86400
     }
-    end = int(time.time() * 1000)
-    start = end - resolution_map[timeframe] * 1000 * 100
+    resolution = resolution_map[timeframe]
+    
+    # Get enough history for 200 candles
+    candles_required = 200
+    ms_per_candle = resolution * 1000
+    now = int(time.time() * 1000)
+    start = now - (candles_required * ms_per_candle)
 
-    url = f"https://www.deribit.com/api/v2/public/get_tradingview_chart_data?instrument_name={instrument_name}&start_timestamp={start}&end_timestamp={end}&resolution={resolution_map[timeframe]}"
+    url = f"https://www.deribit.com/api/v2/public/get_tradingview_chart_data?instrument_name={instrument_name}&start_timestamp={start}&end_timestamp={now}&resolution={resolution}"
     r = requests.get(url)
-    data = r.json()["result"]
-    df = pd.DataFrame(data)
-    if df.empty: return None
+    json_data = r.json()
 
-    df = df.rename(columns={
-        "ticks": "timestamp",
-        "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
+    if 'result' not in json_data or not json_data['result']['ticks']:
+        return None  # Return None if no candles
+
+    data = json_data['result']
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(data["ticks"], unit='ms'),
+        "open": data["o"],
+        "high": data["h"],
+        "low": data["l"],
+        "close": data["c"],
+        "volume": data["v"]
     })
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
     return df
+
 
 # ───────────────────────────────────────
 # 🎛️ Sidebar - User Controls
